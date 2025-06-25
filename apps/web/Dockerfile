@@ -19,8 +19,8 @@ COPY apps/web/ apps/web/
 COPY packages/db/ packages/db/
 COPY packages/auth/ packages/auth/
 
-ENV NODE_ENV production
-ENV NEXT_TELEMETRY_DISABLED 1
+ARG NODE_ENV production
+ARG NEXT_TELEMETRY_DISABLED 1
 
 WORKDIR /app/apps/web
 RUN bun run build
@@ -29,8 +29,8 @@ RUN bun run build
 FROM base AS runner
 WORKDIR /app
 
-ENV NODE_ENV production
-ENV NEXT_TELEMETRY_DISABLED 1
+ARG NODE_ENV production
+ARG NEXT_TELEMETRY_DISABLED 1
 
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
@@ -45,7 +45,7 @@ USER nextjs
 
 EXPOSE 3000
 
-ENV PORT=3000
-ENV HOSTNAME="0.0.0.0"
+ARG PORT=3000
+ARG HOSTNAME="0.0.0.0"
 
 CMD ["bun", "apps/web/server.js"]
