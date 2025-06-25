@@ -25,6 +25,7 @@ import {
 import { useTimelineStore, type TimelineTrack } from "@/stores/timeline-store";
 import { useMediaStore } from "@/stores/media-store";
 import { usePlaybackStore } from "@/stores/playback-store";
+import { useDragClip } from "@/hooks/use-drag-clip";
 import { processMediaFiles } from "@/lib/media-processing";
 import { toast } from "sonner";
 import { useState, useRef, useEffect, useCallback } from "react";
@@ -1163,9 +1164,19 @@ function TimelineTrackContent({
     deselectClip,
   } = useTimelineStore();
   const { currentTime } = usePlaybackStore();
+
+  // Mouse-based drag hook
+  const {
+    isDragging,
+    draggedClipId,
+    startDrag,
+    endDrag,
+    getDraggedClipPosition,
+    isValidDropTarget,
+    timelineRef,
+  } = useDragClip(zoomLevel);
   const [isDropping, setIsDropping] = useState(false);
   const [dropPosition, setDropPosition] = useState<number | null>(null);
-  const [isDraggedOver, setIsDraggedOver] = useState(false);
   const [wouldOverlap, setWouldOverlap] = useState(false);
   const [resizing, setResizing] = useState<{
     clipId: string;
@@ -1240,38 +1251,43 @@ function TimelineTrackContent({
     setResizing(null);
   };
 
-  const handleClipDragStart = (e: React.DragEvent, clip: any) => {
+  const [justFinishedDrag, setJustFinishedDrag] = useState(false);
+
+  const handleClipMouseDown = (e: React.MouseEvent, clip: any) => {
+    // Handle selection first
+    if (!justFinishedDrag) {
+      const isSelected = selectedClips.some(
+        (c) => c.trackId === track.id && c.clipId === clip.id
+      );
+
+      if (e.metaKey || e.ctrlKey || e.shiftKey) {
+        // Multi-selection mode: toggle the clip
+        selectClip(track.id, clip.id, true);
+      } else if (!isSelected) {
+        // If clip is not selected, select it (replacing other selections)
+        selectClip(track.id, clip.id, false);
+      }
+      // Note: Don't deselect if already selected, as user might want to drag
+    }
+
     // Calculate the offset from the left edge of the clip to where the user clicked
-    const clipElement = e.currentTarget.parentElement as HTMLElement;
+    const clipElement = e.currentTarget as HTMLElement;
     const clipRect = clipElement.getBoundingClientRect();
     const clickOffsetX = e.clientX - clipRect.left;
     const clickOffsetTime = clickOffsetX / (50 * zoomLevel);
 
-    const dragData = {
-      clipId: clip.id,
-      trackId: track.id,
-      name: clip.name,
-      clickOffsetTime: clickOffsetTime,
-    };
-
-    e.dataTransfer.setData(
-      "application/x-timeline-clip",
-      JSON.stringify(dragData)
-    );
-    e.dataTransfer.effectAllowed = "move";
-
-    // Add visual feedback to the dragged element
-    const target = e.currentTarget.parentElement as HTMLElement;
-    target.style.opacity = "0.5";
-    target.style.transform = "scale(0.95)";
+    startDrag(e, clip.id, track.id, clip.startTime, clickOffsetTime);
   };
 
-  const handleClipDragEnd = (e: React.DragEvent) => {
-    // Reset visual feedback
-    const target = e.currentTarget.parentElement as HTMLElement;
-    target.style.opacity = "";
-    target.style.transform = "";
-  };
+  // Reset drag flag when drag ends
+  useEffect(() => {
+    if (!isDragging && justFinishedDrag) {
+      const timer = setTimeout(() => setJustFinishedDrag(false), 50);
+      return () => clearTimeout(timer);
+    } else if (isDragging && !justFinishedDrag) {
+      setJustFinishedDrag(true);
+    }
+  }, [isDragging, justFinishedDrag]);
 
   const handleTrackDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -1388,14 +1404,12 @@ function TimelineTrackContent({
 
     if (wouldOverlap) {
       e.dataTransfer.dropEffect = "none";
-      setIsDraggedOver(true);
       setWouldOverlap(true);
       setDropPosition(Math.round(dropTime * 10) / 10);
       return;
     }
 
     e.dataTransfer.dropEffect = hasTimelineClip ? "move" : "copy";
-    setIsDraggedOver(true);
     setWouldOverlap(false);
     setDropPosition(Math.round(dropTime * 10) / 10);
   };
@@ -1414,7 +1428,6 @@ function TimelineTrackContent({
 
     dragCounterRef.current++;
     setIsDropping(true);
-    setIsDraggedOver(true);
   };
 
   const handleTrackDragLeave = (e: React.DragEvent) => {
@@ -1433,7 +1446,6 @@ function TimelineTrackContent({
 
     if (dragCounterRef.current === 0) {
       setIsDropping(false);
-      setIsDraggedOver(false);
       setWouldOverlap(false);
       setDropPosition(null);
     }
@@ -1446,7 +1458,6 @@ function TimelineTrackContent({
     // Reset all drag states
     dragCounterRef.current = 0;
     setIsDropping(false);
-    setIsDraggedOver(false);
     setWouldOverlap(false);
     const currentDropPosition = dropPosition;
     setDropPosition(null);
@@ -1726,10 +1737,18 @@ function TimelineTrackContent({
       onDragLeave={handleTrackDragLeave}
       onDrop={handleTrackDrop}
       onMouseMove={handleResizeMove}
-      onMouseUp={handleResizeEnd}
+      onMouseUp={(e) => {
+        handleResizeEnd();
+        if (isDragging) {
+          endDrag(track.id);
+        }
+      }}
       onMouseLeave={handleResizeEnd}
     >
-      <div className="h-full relative track-clips-container min-w-full">
+      <div
+        ref={timelineRef}
+        className="h-full relative track-clips-container min-w-full"
+      >
         {track.clips.length === 0 ? (
           <div
             className={`h-full w-full rounded-sm border-2 border-dashed flex items-center justify-center text-xs text-muted-foreground transition-colors ${
@@ -1755,17 +1774,31 @@ function TimelineTrackContent({
                 80,
                 effectiveDuration * 50 * zoomLevel
               );
-              const clipLeft = clip.startTime * 50 * zoomLevel;
+
+              // Use real-time position during drag, otherwise use stored position
+              const dragPosition = getDraggedClipPosition(clip.id);
+              const clipStartTime =
+                dragPosition !== null ? dragPosition : clip.startTime;
+              const clipLeft = clipStartTime * 50 * zoomLevel;
+
               const isSelected = selectedClips.some(
                 (c) => c.trackId === track.id && c.clipId === clip.id
               );
+
+              const isBeingDragged = draggedClipId === clip.id;
               return (
                 <div
                   key={clip.id}
-                  className={`timeline-clip absolute h-full border ${getTrackColor(track.type)} flex items-center py-3 min-w-[80px] overflow-hidden group hover:shadow-lg ${isSelected ? "ring-2 ring-blue-500 z-10" : ""}`}
+                  className={`timeline-clip absolute h-full border ${getTrackColor(track.type)} flex items-center py-3 min-w-[80px] overflow-hidden group hover:shadow-lg ${isSelected ? "ring-2 ring-blue-500 z-10" : ""} ${isBeingDragged ? "shadow-lg z-20" : ""} ${isBeingDragged ? "cursor-grabbing" : "cursor-grab"}`}
                   style={{ width: `${clipWidth}px`, left: `${clipLeft}px` }}
+                  onMouseDown={(e) => handleClipMouseDown(e, clip)}
                   onClick={(e) => {
                     e.stopPropagation();
+
+                    // Don't handle click if we just finished dragging
+                    if (justFinishedDrag) {
+                      return;
+                    }
 
                     // Close context menu if it's open
                     if (contextMenu) {
@@ -1773,19 +1806,14 @@ function TimelineTrackContent({
                       return; // Don't handle selection when closing context menu
                     }
 
+                    // Only handle deselection here (selection is handled in mouseDown)
                     const isSelected = selectedClips.some(
                       (c) => c.trackId === track.id && c.clipId === clip.id
                     );
 
-                    if (e.metaKey || e.ctrlKey || e.shiftKey) {
-                      // Multi-selection mode: toggle the clip
-                      selectClip(track.id, clip.id, true);
-                    } else if (isSelected) {
-                      // If clip is already selected, deselect it
+                    if (isSelected && !e.metaKey && !e.ctrlKey && !e.shiftKey) {
+                      // If clip is already selected and no modifier keys, deselect it
                       deselectClip(track.id, clip.id);
-                    } else {
-                      // If clip is not selected, select it (replacing other selections)
-                      selectClip(track.id, clip.id, false);
                     }
                   }}
                   tabIndex={0}
@@ -1803,16 +1831,14 @@ function TimelineTrackContent({
                 >
                   {/* Left trim handle */}
                   <div
-                    className="absolute left-0 top-0 bottom-0 w-2 cursor-w-resize opacity-0 group-hover:opacity-100 transition-opacity bg-blue-500/50 hover:bg-blue-500"
-                    onMouseDown={(e) => handleResizeStart(e, clip.id, "left")}
+                    className={`absolute left-0 top-0 bottom-0 w-2 cursor-w-resize transition-opacity bg-blue-500/50 hover:bg-blue-500 ${isSelected ? "opacity-100" : "opacity-0"}`}
+                    onMouseDown={(e) => {
+                      e.stopPropagation(); // Prevent triggering clip drag
+                      handleResizeStart(e, clip.id, "left");
+                    }}
                   />
                   {/* Clip content */}
-                  <div
-                    className="flex-1 cursor-grab active:cursor-grabbing relative"
-                    draggable={true}
-                    onDragStart={(e) => handleClipDragStart(e, clip)}
-                    onDragEnd={handleClipDragEnd}
-                  >
+                  <div className="flex-1 relative">
                     {renderClipContent(clip)}
                     {/* Clip options menu */}
                     <div className="absolute top-1 right-1 z-10">
@@ -1821,11 +1847,15 @@ function TimelineTrackContent({
                         size="icon"
                         className="opacity-0 group-hover:opacity-100 transition-opacity"
                         onClick={() => setClipMenuOpen(clip.id)}
+                        onMouseDown={(e) => e.stopPropagation()}
                       >
                         <MoreVertical className="h-4 w-4" />
                       </Button>
                       {clipMenuOpen === clip.id && (
-                        <div className="absolute right-0 mt-2 w-32 bg-white border rounded shadow z-50">
+                        <div
+                          className="absolute right-0 mt-2 w-32 bg-white border rounded shadow z-50"
+                          onMouseDown={(e) => e.stopPropagation()}
+                        >
                           <button
                             className="flex items-center w-full px-3 py-2 text-sm hover:bg-muted/30"
                             onClick={() => {
@@ -1847,8 +1877,11 @@ function TimelineTrackContent({
                   </div>
                   {/* Right trim handle */}
                   <div
-                    className="absolute right-0 top-0 bottom-0 w-2 cursor-e-resize opacity-0 group-hover:opacity-100 transition-opacity bg-blue-500/50 hover:bg-blue-500"
-                    onMouseDown={(e) => handleResizeStart(e, clip.id, "right")}
+                    className={`absolute right-0 top-0 bottom-0 w-2 cursor-e-resize transition-opacity bg-blue-500/50 hover:bg-blue-500 ${isSelected ? "opacity-100" : "opacity-0"}`}
+                    onMouseDown={(e) => {
+                      e.stopPropagation(); // Prevent triggering clip drag
+                      handleResizeStart(e, clip.id, "right");
+                    }}
                   />
                 </div>
               );
